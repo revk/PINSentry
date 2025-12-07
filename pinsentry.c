@@ -54,6 +54,8 @@ usb_connect (const char *usbid)
    if ((r = libusb_claim_interface (usb, 0)))   // Interface 0
       errx (1, "Cannot claim USB: %s", libusb_strerror (r));
 
+   // TODO finding endpoint identifiers somehow
+
    return usb;
 }
 
@@ -64,6 +66,21 @@ usb_disconnect (libusb_device_handle *usb)
    libusb_release_interface (usb, 0);   // Interface 0
    libusb_close (usb);
    libusb_exit (NULL);
+}
+
+uint8_t
+usb_int_rx (libusb_device_handle *usb, uint8_t max, uint8_t *rx, int to)
+{                               // Wait for interrupt
+   assert (usb);
+   assert (rx);
+   assert (max);
+   int l = 0;
+   int r = libusb_interrupt_transfer (usb, 0x82, rx, max, &l, to);
+   if (r == LIBUSB_ERROR_TIMEOUT)
+      return 0;
+   if (r)
+      errx (1, "Interrupt failed: %s", libusb_strerror (r));
+   return l;
 }
 
 uint32_t
@@ -252,13 +269,13 @@ ccid_power_off (libusb_device_handle *usb)
    return (rx[7] & 3);
 }
 
-uint32_t
+uint16_t
 ccid_card (libusb_device_handle *usb, uint16_t txlen, const uint8_t *tx, uint16_t rxmax, uint8_t *rx)
 {                               // Transfer to card and get response (status at end), return len
    if (debug)
       dumphex ("CardTx", txlen, tx);
-   uint8_t txbuf[10+5+256] = { 0 }; // Allow 256 byte message after 5 byte command
-   uint8_t rxbuf[10+256+2] = { 0 }; // Allow 256 byte response with 2 byte status
+   uint8_t txbuf[10 + 5 + 256] = { 0 }; // Allow 256 byte message after 5 byte command
+   uint8_t rxbuf[10 + 256 + 2] = { 0 }; // Allow 256 byte response with 2 byte status
    txbuf[7] = 1;                // block wait time
    memcpy (txbuf + 10, tx, txlen);
    int l;
@@ -278,6 +295,21 @@ ccid_card (libusb_device_handle *usb, uint16_t txlen, const uint8_t *tx, uint16_
 
 // Card functions
 
+uint16_t
+select_file (libusb_device_handle *usb, uint8_t cla, uint8_t p1, uint8_t p2, uint8_t len, uint8_t *fn)
+{                               // Select file,m return status
+   assert (usb);
+   assert (len);
+   assert (fn);
+   uint8_t tx[5 + 7] = { cla, 0xA4, p1, p2, len };
+   assert (len <= sizeof (tx) - 5);
+   memcpy (tx + 5, fn, len);
+   uint8_t rx[2];
+   uint16_t res = ccid_card (usb, 5 + len, tx, sizeof (rx), rx);
+   if (res != 2)
+      return 0;
+   return (rx[0] << 8) | rx[1];
+}
 
 int
 main (int argc, const char *argv[])
@@ -321,6 +353,19 @@ main (int argc, const char *argv[])
 
    // Card insert...
    card_status_t status = card_status (usb);
+   if (status == card_error)
+      errx (1, "Card status error");
+   if (status == card_missing)
+   {
+      fprintf (stderr, "Insert card\n");
+      while (status == card_missing)
+      {
+         uint8_t rx[2];
+         usb_int_rx (usb, sizeof (rx), rx, 10000);
+         status = card_status (usb);
+      }
+   }
+   // TODO
    warnx ("status=%d", status);
 
    // Power on
@@ -328,6 +373,16 @@ main (int argc, const char *argv[])
    uint8_t atrlen = ccid_power_on (usb, voltage, sizeof (atr), atr);
    if (debug && atrlen)
       dumphex ("ATR", atrlen, atr);
+
+   // Select file (try two different ones)
+   if (select_file (usb, 0x00, 0x04, 0, 7, (uint8_t[])
+                    {
+                    0xA0, 0x00, 0x00, 0x00, 0x03, 0x80, 0x02}
+       ) >> 8 != 0x61 && select_file (usb, 0x00, 0x04, 0, 7, (uint8_t[])
+                                      {
+                                      0xA0, 0x00, 0x00, 0x00, 0x04, 0x80, 0x02}
+       ) >> 8 != 0x61)
+      warnx ("Select file failed, may be wrong card");
 
    // Power off
    ccid_power_off (usb);
