@@ -226,11 +226,10 @@ ccid_power_on (libusb_device_handle *usb, float voltage, int max, uint8_t *atr)
    uint8_t tx[10] = { 0 };      // 0 is auto voltage
    if (voltage == 5)
       tx[7] = 1;
-   if (voltage == 3.0 || voltage == 3.3)
+   else if (voltage == 3.0 || voltage == 3.3)
       tx[7] = 2;                // Is 3.3 valid ?
-   if (voltage == 1.8)
+   else if (voltage == 1.8)
       tx[7] = 3;
-   tx[7] = 2;                   // 3 V
    uint8_t rx[266];
    uint32_t l;
    if ((l = ccid_txn (usb, 0x62, sizeof (tx), tx, 0x80, sizeof (rx), rx)) < 10)
@@ -270,7 +269,7 @@ ccid_power_off (libusb_device_handle *usb)
 }
 
 uint16_t
-ccid_card (libusb_device_handle *usb, uint16_t txlen, const uint8_t *tx, uint16_t rxmax, uint8_t *rx)
+card_txn (libusb_device_handle *usb, uint16_t txlen, const uint8_t *tx, uint16_t rxmax, uint8_t *rx)
 {                               // Transfer to card and get response (status at end), return len
    if (debug)
       dumphex ("CardTx", txlen, tx);
@@ -297,7 +296,7 @@ ccid_card (libusb_device_handle *usb, uint16_t txlen, const uint8_t *tx, uint16_
 
 uint16_t
 select_file (libusb_device_handle *usb, uint8_t cla, uint8_t p1, uint8_t p2, uint8_t len, uint8_t *fn)
-{                               // Select file,m return status
+{                               // Select file, return status
    assert (usb);
    assert (len);
    assert (fn);
@@ -305,10 +304,39 @@ select_file (libusb_device_handle *usb, uint8_t cla, uint8_t p1, uint8_t p2, uin
    assert (len <= sizeof (tx) - 5);
    memcpy (tx + 5, fn, len);
    uint8_t rx[2];
-   uint16_t res = ccid_card (usb, 5 + len, tx, sizeof (rx), rx);
+   uint16_t res = card_txn (usb, 5 + len, tx, sizeof (rx), rx);
    if (res != 2)
       return 0;
    return (rx[0] << 8) | rx[1];
+}
+
+uint16_t
+get_response (libusb_device_handle *usb, uint8_t len, uint16_t max, uint8_t *rx)
+{                               // Get response
+   assert (usb);
+   assert (rx);
+   assert (max >= len + 2);
+   uint8_t tx[] = { 0x00, 0xC0, 0x00, 0x00, len };
+   uint16_t l = card_txn (usb, sizeof (tx), tx, max, rx);
+   if (l != len + 2)
+   {
+      warnx ("Bad get response");
+      return 0;
+   }
+   if (rx[l - 2] >> 4 != 9)
+      warnx ("Bad get response status %02X%02X", rx[l - 2], rx[l - 1]);
+   return l;
+}
+
+uint16_t
+read_file (libusb_device_handle *usb, uint8_t p1, uint8_t p2, uint8_t len, uint16_t max, uint8_t *rx)
+{
+   assert (usb);
+   assert (rx);
+   assert (max >= len + 2);
+   uint8_t tx[] = { 0x00, 0xB2, p1, p2, len };
+   uint16_t l = card_txn (usb, sizeof (tx), tx, max, rx);
+
 }
 
 int
@@ -317,15 +345,17 @@ main (int argc, const char *argv[])
    float voltage = 3;
    const char *port = "303a:0000";
    const char *pin = NULL;
+   int pan = 0;
    int identify = 0;
    const char *respond = NULL;
    const char *sign = NULL;
    poptContext optCon;          // context for parsing command-line options
    {                            // POPT
       const struct poptOption optionsTable[] = {
+         {"pan", 'P', POPT_ARG_NONE, &pan, 0, "Get PAN"},
          {"identify", 'I', POPT_ARG_NONE, &identify, 0, "Identify"},
          {"respond", 'R', POPT_ARG_STRING, &respond, 0, "Respond", "XXXXXXXX"},
-         {"sign", 'S', POPT_ARG_STRING, &sign, 0, "Sign", "XXXXXXXX XXX.XX"},
+         {"sign", 'S', POPT_ARG_STRING, &sign, 0, "Sign", "XXXXXXXX+XXX.XX"},
          {"pin", 'p', POPT_ARG_STRING, &pin, 0, "PIN", "XXXX"},
          {"usb", 'u', POPT_ARG_STRING | POPT_ARGFLAG_SHOW_DEFAULT, &port, 0, "USB Device", "VVVV:PPPP"},
          {"voltage", 'V', POPT_ARG_FLOAT | POPT_ARGFLAG_SHOW_DEFAULT, &voltage, 0, "Voltage", "V"},
@@ -341,7 +371,7 @@ main (int argc, const char *argv[])
       if ((c = poptGetNextOpt (optCon)) < -1)
          errx (1, "%s: %s\n", poptBadOption (optCon, POPT_BADOPTION_NOALIAS), poptStrerror (c));
 
-      if (poptPeekArg (optCon) || (!identify && !respond && !sign))
+      if (poptPeekArg (optCon) || (identify ? 1 : 0) + (respond ? 1 : 0) + (sign ? 1 : 0) != 1)
       {
          poptPrintUsage (optCon, stderr, 0);
          return -1;
@@ -351,39 +381,143 @@ main (int argc, const char *argv[])
    if (!usb)
       errx (1, "Failed to open USB %s", port);
 
-   // Card insert...
-   card_status_t status = card_status (usb);
-   if (status == card_error)
-      errx (1, "Card status error");
-   if (status == card_missing)
-   {
-      fprintf (stderr, "Insert card\n");
-      while (status == card_missing)
+   {                            // Card insert...
+      card_status_t status = card_status (usb);
+      if (status == card_error)
+         errx (1, "Card status error");
+      if (status == card_missing)
       {
-         uint8_t rx[2];
-         usb_int_rx (usb, sizeof (rx), rx, 10000);
-         status = card_status (usb);
+         fprintf (stderr, "Insert card\n");
+         while (status == card_missing)
+         {
+            uint8_t rx[2];
+            usb_int_rx (usb, sizeof (rx), rx, 10000);
+            status = card_status (usb);
+         }
       }
    }
-   // TODO
-   warnx ("status=%d", status);
 
-   // Power on
-   uint8_t atr[256];
-   uint8_t atrlen = ccid_power_on (usb, voltage, sizeof (atr), atr);
-   if (debug && atrlen)
-      dumphex ("ATR", atrlen, atr);
+   uint16_t status = 0;
+   uint8_t rx[256];
+   uint8_t len;
 
-   // Select file (try two different ones)
-   if (select_file (usb, 0x00, 0x04, 0, 7, (uint8_t[])
-                    {
-                    0xA0, 0x00, 0x00, 0x00, 0x03, 0x80, 0x02}
-       ) >> 8 != 0x61 && select_file (usb, 0x00, 0x04, 0, 7, (uint8_t[])
-                                      {
-                                      0xA0, 0x00, 0x00, 0x00, 0x04, 0x80, 0x02}
-       ) >> 8 != 0x61)
-      warnx ("Select file failed, may be wrong card");
+   {                            // Power on
+      if ((len = ccid_power_on (usb, voltage, sizeof (rx), rx)) < 2)
+         warnx ("Power on fail");
+      else if (debug)
+         dumphex ("ATR", len, rx);
+   }
+   {                            // Select file (try two different ones)
+      if ((status = select_file (usb, 0x00, 0x04, 0, 7, (uint8_t[])
+                                 {
+                                 0xA0, 0x00, 0x00, 0x00, 0x03, 0x80, 0x02}
+           )) >> 8 != 0x61 && (status = select_file (usb, 0x00, 0x04, 0, 7, (uint8_t[])
+                                                     {
+                                                     0xA0, 0x00, 0x00, 0x00, 0x04, 0x80, 0x02}
+                               )) >> 8 != 0x61)
+         warnx ("Select file failed, may be wrong card");
+      else
+         get_response (usb, status & 0xFF, sizeof (rx), rx);
+   }
 
+   {                            // Not sure what this does...
+      uint8_t tx[] = { 0x80, 0xA8, 0x00, 0x00, 0x02, 0x83, 0x00 };
+      if ((len = card_txn (usb, sizeof (tx), tx, sizeof (rx), rx)) != 2 || *rx != 0x61)
+         warnx ("Failed 0xA8");
+      else
+         get_response (usb, rx[1], sizeof (rx), rx);
+   }
+
+   if (pan)
+   {                            // Get PAN -- TODO presumably this used to work once upon a time.
+      if (!(len = read_file (usb, 0x02, 0x0C, 0, sizeof (rx), rx)) || rx[len - 2] != 0x90)
+         errx (1, "Could not read PAN");
+      for (int n = 4; n < 12; n++)
+         printf ("%02X", rx[n]);
+      printf ("\n");
+
+   }
+
+   if (identify || respond || sign || debug)
+   {                            // send PIN
+      if (pin)
+      {                         // Send PIN
+         uint8_t tx[] = { 0x00, 0x20, 0x00, 0x80, 0x08, 0x24, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+         uint8_t n = 6;
+         for (const char *p = pin; *p && isdigit (*p) && n < sizeof (tx); p++)
+         {
+            tx[n] = ((*p & 0xF) << 4) + 0xF;
+            if (p[1] && isdigit (*p))
+            {
+               p++;
+               tx[n] = (tx[n] & 0xF0) + (*p & 0xF);
+            }
+            n++;
+         }
+         if (card_txn (usb, sizeof (tx), tx, sizeof (rx), rx) < 2)
+            errx (1, "PIN fail");
+         if (*rx != 0x90)
+         {
+            if (*rx == 0x63 && rx[1] >> 4 == 12)
+               errx (1, "Wrong PIN, %d tries remaining", rx[1] & 0xF);
+            errx (1, "PIN failed");
+         }
+      } else
+      {                         // User reader to get PIN
+         // TODO 
+      }
+   }
+
+
+   if (identify || respond || sign)
+   {                            // OTP logic
+      uint8_t tx[36] = { 0x80, 0xAE, 0x80, 0x00, 29 };
+      tx[19] = 0x80;
+      tx[26] = tx[27] = tx[28] = 1;
+      if (respond || sign)
+      {                         // Challenge digits or account
+         const char *chal = respond ? : sign;
+         int n = 0;
+         for (int p = 0; chal[p] && chal[p] != '+'; p++)
+            if (isdigit (chal[p]))
+               n++;
+         for (int p = 0; chal[p] && chal[p] != '+' && n; p++)
+            if (isdigit (chal[p]))
+            {
+               n--;
+               if (n < 8)
+                  tx[33 - n / 2] |= ((chal[p] & 0xF) << ((n & 1) ? 4 : 0));
+            }
+      }
+      if (sign)
+      {                         // Amount
+         const char *amount = sign;
+         while (*amount && *amount != '+')
+            amount++;
+         if (*amount != '+')
+            errx (1, "--sign=ACCOUNT+AMOUNT");
+         amount++;
+         int n = 0;
+         for (int p = 0; amount[p]; p++)
+            if (isdigit (amount[p]))
+               n++;
+         for (int p = 0; amount[p] && n; p++)
+            if (isdigit (amount[p]))
+            {
+               n--;
+               if (n < 12)
+                  tx[10 - n / 2] |= ((amount[p] & 0xF) << ((n & 1) ? 4 : 0));
+            }
+      }
+      if (card_txn (usb, 5 + tx[4], tx, sizeof (rx), rx) != 2 || *rx != 0x61)
+         errx (1, "OTP fail");
+      if ((len = get_response (usb, rx[1], sizeof (rx), rx)) != 22 || rx[len - 2] != 0x90)
+         errx (1, "OTP fail");
+      uint32_t res = ((1 << 25) | (rx[4] << 17) | ((rx[10] & 0x01) << 16) | (rx[11] << 8) | rx[12]);
+      printf ("%08lu\n", res);
+
+      // TODO there is a further message that perhaps advances the OTP
+   }
    // Power off
    ccid_power_off (usb);
 
