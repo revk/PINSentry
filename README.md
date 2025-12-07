@@ -7,7 +7,7 @@ This is a command line for bank card validation, as per Barclays PIN Sentry, and
 The key functions are 
 
 - IDENTIFY - provides an 8 digit code to prove you have the card and know the PIN
-- RESPOND - allow entry of a code and get a response, with PIN check
+- RESPOND - allow entry of a challenge code and get a response, with PIN check
 - SIGN - allow entry for an account and amount to validate a payment, with PIN check.
 
 ## PIN Entry
