@@ -513,9 +513,11 @@ main (int argc, const char *argv[])
       if (card_txn (usb, 5 + tx[4], tx, sizeof (rx), rx) != 2 || *rx != 0x61)
          errx (1, "OTP fail");
       if ((len = get_response (usb, rx[1], sizeof (rx), rx)) != 22 || rx[len - 2] != 0x90)
-         errx (1, "OTP fail");
+         errx (1, "OTP fail %u", len);
       uint32_t res = ((1 << 25) | (rx[4] << 17) | ((rx[10] & 0x01) << 16) | (rx[11] << 8) | rx[12]);
       printf ("%08lu\n", res);
+
+      // TODO Lloyds seems different and needs some debug
 
       // TODO there is a further message that perhaps advances the OTP
    }
