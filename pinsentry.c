@@ -474,6 +474,7 @@ main (int argc, const char *argv[])
       uint8_t tx[36] = { 0x80, 0xAE, 0x80, 0x00, 29 };
       tx[19] = 0x80;
       tx[26] = tx[27] = tx[28] = 1;
+      // TODO Message length may need adjusting as well it seems
       if (respond || sign)
       {                         // Challenge digits or account
          const char *chal = respond ? : sign;
